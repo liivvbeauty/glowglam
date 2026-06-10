@@ -175,14 +175,6 @@ st.markdown(
         font-weight: 800;
         color: #7A3C4B;
     }
-
-    .glow-image {
-        width: 100%;
-        border-radius: 18px;
-        box-shadow: 0 8px 20px rgba(0,0,0,0.10);
-        object-fit: cover;
-        display: block;
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -235,15 +227,16 @@ def convert_google_drive_url(url: str) -> str:
     if not url or url.lower() == "nan":
         return ""
 
-    match = re.search(r"/file/d/([^/]+)", url)
-    if "drive.google.com" in url and match:
-        file_id = match.group(1)
-        return f"https://drive.google.com/uc?export=view&id={file_id}"
+    if "drive.google.com" in url:
+        match = re.search(r"/file/d/([^/]+)", url)
+        if match:
+            file_id = match.group(1)
+            return f"https://drive.google.com/thumbnail?id={file_id}&sz=w1200"
 
-    match = re.search(r"[?&]id=([^&]+)", url)
-    if "drive.google.com" in url and match:
-        file_id = match.group(1)
-        return f"https://drive.google.com/uc?export=view&id={file_id}"
+        match = re.search(r"[?&]id=([^&]+)", url)
+        if match:
+            file_id = match.group(1)
+            return f"https://drive.google.com/thumbnail?id={file_id}&sz=w1200"
 
     return url
 
@@ -343,12 +336,17 @@ def render_image(image_url: str):
         st.info("Imagem ainda não cadastrada no catálogo visual.")
         return
 
-    st.markdown(
-        f"""
-        <img src="{image_url}" class="glow-image" referrerpolicy="no-referrer">
-        """,
-        unsafe_allow_html=True,
-    )
+    try:
+        st.image(image_url, use_container_width=True)
+    except Exception:
+        st.markdown(
+            f"""
+            <a href="{image_url}" target="_blank">
+                Abrir imagem da recomendação
+            </a>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def render_result(row, rank: int):
