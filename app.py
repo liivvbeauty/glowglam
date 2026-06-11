@@ -15,6 +15,8 @@ st.set_page_config(
 )
 
 SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
+CLIENT_SPREADSHEET_ID = st.secrets.get("CLIENT_SPREADSHEET_ID", SPREADSHEET_ID)
+
 SHEET_NAME = st.secrets.get("SHEET_NAME", "Base_Glow_Glam")
 CLIENT_SHEET_NAME = st.secrets.get("CLIENT_SHEET_NAME", "Clientes_Glow_Glam")
 LOG_WEBAPP_URL = st.secrets.get("LOG_WEBAPP_URL", "")
@@ -25,7 +27,7 @@ DEFAULT_CSV_URL = (
 )
 
 CLIENTS_CSV_URL = (
-    f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq"
+    f"https://docs.google.com/spreadsheets/d/{CLIENT_SPREADSHEET_ID}/gviz/tq"
     f"?tqx=out:csv&sheet={urllib.parse.quote(CLIENT_SHEET_NAME)}"
 )
 
