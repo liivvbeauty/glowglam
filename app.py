@@ -16,10 +16,17 @@ st.set_page_config(
 
 SPREADSHEET_ID = st.secrets.get("SPREADSHEET_ID", "")
 SHEET_NAME = st.secrets.get("SHEET_NAME", "Base_Glow_Glam")
+CLIENT_SHEET_NAME = st.secrets.get("CLIENT_SHEET_NAME", "Clientes_Glow_Glam")
+LOG_WEBAPP_URL = st.secrets.get("LOG_WEBAPP_URL", "")
 
 DEFAULT_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq"
     f"?tqx=out:csv&sheet={urllib.parse.quote(SHEET_NAME)}"
+)
+
+CLIENTS_CSV_URL = (
+    f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq"
+    f"?tqx=out:csv&sheet={urllib.parse.quote(CLIENT_SHEET_NAME)}"
 )
 
 SHEET_URL = st.secrets.get("GOOGLE_SHEET_CSV_URL", DEFAULT_CSV_URL)
@@ -187,6 +194,10 @@ def normalize_text(value: str) -> str:
     return "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
 
 
+def normalize_phone(value: str) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
 def split_values(value: str) -> list[str]:
     return [p.strip() for p in re.split(r"[;|,]", str(value or "")) if p.strip()]
 
@@ -242,10 +253,7 @@ def convert_google_drive_url(url: str) -> str:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def load_data(url: str) -> pd.DataFrame:
-    if not SPREADSHEET_ID and "GOOGLE_SHEET_CSV_URL" not in st.secrets:
-        raise ValueError("Configure SPREADSHEET_ID nos Secrets do Streamlit.")
-
+def read_google_csv(url: str) -> pd.DataFrame:
     response = requests.get(
         url,
         timeout=30,
@@ -261,7 +269,15 @@ def load_data(url: str) -> pd.DataFrame:
         )
 
     df = pd.read_csv(StringIO(response.text), encoding="utf-8-sig")
-    df = normalize_columns(df)
+    return normalize_columns(df).fillna("")
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_data(url: str) -> pd.DataFrame:
+    if not SPREADSHEET_ID and "GOOGLE_SHEET_CSV_URL" not in st.secrets:
+        raise ValueError("Configure SPREADSHEET_ID nos Secrets do Streamlit.")
+
+    df = read_google_csv(url)
 
     required = [
         "ativo",
@@ -286,6 +302,55 @@ def load_data(url: str) -> pd.DataFrame:
     df["score_base"] = pd.to_numeric(df["score_base"], errors="coerce").fillna(0)
 
     return df.fillna("")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_clients(url: str) -> pd.DataFrame:
+    df = read_google_csv(url)
+
+    required = ["ativo", "nome_cliente", "telefone"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Colunas ausentes na aba de clientes: {missing}")
+
+    df["telefone_normalizado"] = df["telefone"].astype(str).apply(normalize_phone)
+    df["nome_normalizado"] = df["nome_cliente"].astype(str).apply(normalize_text)
+
+    return df.fillna("")
+
+
+def is_authorized_client(clientes_df: pd.DataFrame, nome: str, telefone: str) -> bool:
+    nome_norm = normalize_text(nome)
+    tel_norm = normalize_phone(telefone)
+
+    if not nome_norm or not tel_norm:
+        return False
+
+    ativos = clientes_df[
+        clientes_df["ativo"].astype(str).str.strip().str.casefold().eq("sim")
+    ].copy()
+
+    match_tel = ativos["telefone_normalizado"].eq(tel_norm)
+    match_nome = ativos["nome_normalizado"].apply(
+        lambda n: nome_norm in n or n in nome_norm
+    )
+
+    return bool(ativos[match_tel & match_nome].shape[0] > 0)
+
+
+def log_access(payload: dict) -> None:
+    if not LOG_WEBAPP_URL:
+        return
+
+    try:
+        requests.post(
+            LOG_WEBAPP_URL,
+            json=payload,
+            timeout=10,
+            headers={"User-Agent": "GlowGlam-LIIVV"},
+        )
+    except Exception:
+        pass
 
 
 def calculate_score(row, filtros: dict) -> float:
@@ -409,11 +474,60 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
+if not st.session_state.get("cliente_autorizado"):
+    st.markdown(
+        """
+        <div class="intro-card">
+            <div class="intro-title">Acesso exclusivo para clientes LIIVV</div>
+            <p class="intro-text">
+                Informe seu nome e telefone para acessar sua recomendação Glow Glam.
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    try:
+        clientes_df = load_clients(CLIENTS_CSV_URL)
+    except Exception as exc:
+        st.error("Não foi possível carregar a lista de clientes autorizados.")
+        with st.expander("Detalhes técnicos"):
+            st.code(str(exc))
+        st.stop()
+
+    with st.form("login_cliente"):
+        nome_login = st.text_input("Nome")
+        telefone_login = st.text_input("Telefone / WhatsApp")
+        entrar = st.form_submit_button("Acessar Glow Glam")
+
+    if entrar:
+        autorizado = is_authorized_client(clientes_df, nome_login, telefone_login)
+
+        log_access({
+            "nome_informado": nome_login,
+            "telefone_informado": telefone_login,
+            "status_acesso": "autorizado" if autorizado else "negado",
+            "acao": "login"
+        })
+
+        if autorizado:
+            st.session_state["cliente_autorizado"] = True
+            st.session_state["nome_cliente"] = nome_login
+            st.session_state["telefone_cliente"] = telefone_login
+            st.rerun()
+        else:
+            st.error("Não localizamos seu cadastro. Fale com a recepção da LIIVV para liberar seu acesso.")
+
+    st.stop()
+
+
 st.markdown(
-    """
+    f"""
     <div class="intro-card">
         <div class="intro-title">Sua produção para depois do trabalho</div>
         <p class="intro-text">
+            Olá, {st.session_state.get("nome_cliente", "cliente")}.
             Responda algumas perguntas e receba uma recomendação completa de cabelo,
             maquiagem, sobrancelha e unha para sua ocasião.
         </p>
@@ -493,6 +607,24 @@ resultado = (
 )
 
 if buscar:
+    log_access({
+        "nome_informado": st.session_state.get("nome_cliente", ""),
+        "telefone_informado": st.session_state.get("telefone_cliente", ""),
+        "status_acesso": "autorizado",
+        "acao": "recomendacao",
+        "ocasiao": ocasiao,
+        "tempo": tempo,
+        "estilo": estilo,
+        "formato_rosto": rosto,
+        "tipo_cabelo": tipo_cabelo,
+        "comprimento": comprimento,
+        "intensidade_maquiagem": intensidade,
+        "foco_maquiagem": foco,
+        "resultado_1": safe_get(resultado.iloc[0], "nome_look", "") if len(resultado) > 0 else "",
+        "resultado_2": safe_get(resultado.iloc[1], "nome_look", "") if len(resultado) > 1 else "",
+        "resultado_3": safe_get(resultado.iloc[2], "nome_look", "") if len(resultado) > 2 else "",
+    })
+
     st.markdown('<div class="section-title">Suas recomendações</div>', unsafe_allow_html=True)
 else:
     st.markdown('<div class="section-title">Sugestões em destaque</div>', unsafe_allow_html=True)
