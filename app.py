@@ -1,11 +1,14 @@
 import re
 import unicodedata
 import urllib.parse
+from datetime import datetime
 from io import StringIO
 
+import gspread
 import pandas as pd
 import requests
 import streamlit as st
+from google.oauth2.service_account import Credentials
 
 
 st.set_page_config(
@@ -19,20 +22,46 @@ CLIENT_SPREADSHEET_ID = st.secrets.get("CLIENT_SPREADSHEET_ID", SPREADSHEET_ID)
 
 SHEET_NAME = st.secrets.get("SHEET_NAME", "Base_Glow_Glam")
 CLIENT_SHEET_NAME = st.secrets.get("CLIENT_SHEET_NAME", "Clientes_Glow_Glam")
-LOG_WEBAPP_URL = st.secrets.get("LOG_WEBAPP_URL", "")
+ACCESS_SHEET_NAME = st.secrets.get("ACCESS_SHEET_NAME", "Acessos_Glow_Glam")
 
-DEFAULT_CSV_URL = (
-    f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq"
-    f"?tqx=out:csv&sheet={urllib.parse.quote(SHEET_NAME)}"
-)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
-CLIENTS_CSV_URL = (
-    f"https://docs.google.com/spreadsheets/d/{CLIENT_SPREADSHEET_ID}/gviz/tq"
-    f"?tqx=out:csv&sheet={urllib.parse.quote(CLIENT_SHEET_NAME)}"
-)
 
-SHEET_URL = st.secrets.get("GOOGLE_SHEET_CSV_URL", DEFAULT_CSV_URL)
+# ─────────────────────────────────────────────────────────────
+# GOOGLE SHEETS
+# ─────────────────────────────────────────────────────────────
 
+@st.cache_resource
+def get_client() -> gspread.Client:
+    credentials = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=SCOPES,
+    )
+    return gspread.authorize(credentials)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def read_sheet(spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
+    worksheet = get_client().open_by_key(spreadsheet_id).worksheet(sheet_name)
+    df = pd.DataFrame(worksheet.get_all_records())
+    return normalize_columns(df).fillna("")
+
+
+def append_access_log(row: list) -> None:
+    worksheet = (
+        get_client()
+        .open_by_key(CLIENT_SPREADSHEET_ID)
+        .worksheet(ACCESS_SHEET_NAME)
+    )
+    worksheet.append_row(row, value_input_option="USER_ENTERED")
+
+
+# ─────────────────────────────────────────────────────────────
+# CSS
+# ─────────────────────────────────────────────────────────────
 
 st.markdown(
     """
@@ -190,6 +219,10 @@ st.markdown(
 )
 
 
+# ─────────────────────────────────────────────────────────────
+# FUNÇÕES AUXILIARES
+# ─────────────────────────────────────────────────────────────
+
 def normalize_text(value: str) -> str:
     value = str(value or "").strip().lower()
     value = unicodedata.normalize("NFD", value)
@@ -254,32 +287,13 @@ def convert_google_drive_url(url: str) -> str:
     return url
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def read_google_csv(url: str) -> pd.DataFrame:
-    response = requests.get(
-        url,
-        timeout=30,
-        allow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "text/csv,text/plain,*/*"},
-    )
-    response.raise_for_status()
-
-    response_start = response.text.lstrip().lower()[:200]
-    if response_start.startswith("<html") or response_start.startswith("<!doctype html"):
-        raise ValueError(
-            "A planilha não retornou CSV. Verifique se ela está pública para leitura por link."
-        )
-
-    df = pd.read_csv(StringIO(response.text), encoding="utf-8-sig")
-    return normalize_columns(df).fillna("")
-
+# ─────────────────────────────────────────────────────────────
+# CARREGAMENTO
+# ─────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
-def load_data(url: str) -> pd.DataFrame:
-    if not SPREADSHEET_ID and "GOOGLE_SHEET_CSV_URL" not in st.secrets:
-        raise ValueError("Configure SPREADSHEET_ID nos Secrets do Streamlit.")
-
-    df = read_google_csv(url)
+def load_data() -> pd.DataFrame:
+    df = read_sheet(SPREADSHEET_ID, SHEET_NAME)
 
     required = [
         "ativo",
@@ -307,8 +321,8 @@ def load_data(url: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_clients(url: str) -> pd.DataFrame:
-    df = read_google_csv(url)
+def load_clients() -> pd.DataFrame:
+    df = read_sheet(CLIENT_SPREADSHEET_ID, CLIENT_SHEET_NAME)
 
     required = ["ativo", "nome_cliente", "telefone"]
     missing = [c for c in required if c not in df.columns]
@@ -321,6 +335,10 @@ def load_clients(url: str) -> pd.DataFrame:
     return df.fillna("")
 
 
+# ─────────────────────────────────────────────────────────────
+# AUTORIZAÇÃO E LOG
+# ─────────────────────────────────────────────────────────────
+
 def is_authorized_client(clientes_df: pd.DataFrame, nome: str, telefone: str) -> bool:
     nome_norm = normalize_text(nome)
     tel_norm = normalize_phone(telefone)
@@ -329,7 +347,9 @@ def is_authorized_client(clientes_df: pd.DataFrame, nome: str, telefone: str) ->
         return False
 
     ativos = clientes_df[
-        clientes_df["ativo"].astype(str).str.strip().str.casefold().eq("sim")
+        clientes_df["ativo"].astype(str).str.strip().str.lower().isin(
+            ["sim", "ativo", "yes", "true", "1"]
+        )
     ].copy()
 
     match_tel = ativos["telefone_normalizado"].eq(tel_norm)
@@ -341,19 +361,35 @@ def is_authorized_client(clientes_df: pd.DataFrame, nome: str, telefone: str) ->
 
 
 def log_access(payload: dict) -> None:
-    if not LOG_WEBAPP_URL:
-        return
-
     try:
-        requests.post(
-            LOG_WEBAPP_URL,
-            json=payload,
-            timeout=10,
-            headers={"User-Agent": "GlowGlam-LIIVV"},
-        )
-    except Exception:
-        pass
+        append_access_log([
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            payload.get("nome_informado", ""),
+            payload.get("telefone_informado", ""),
+            normalize_phone(payload.get("telefone_informado", "")),
+            payload.get("status_acesso", ""),
+            payload.get("acao", ""),
+            payload.get("ocasiao", ""),
+            payload.get("tempo", ""),
+            payload.get("estilo", ""),
+            payload.get("formato_rosto", ""),
+            payload.get("tipo_cabelo", ""),
+            payload.get("comprimento", ""),
+            payload.get("intensidade_maquiagem", ""),
+            payload.get("foco_maquiagem", ""),
+            payload.get("resultado_1", ""),
+            payload.get("resultado_2", ""),
+            payload.get("resultado_3", ""),
+        ])
+    except Exception as exc:
+        st.warning("Log não registrado.")
+        with st.expander("Detalhes técnicos do log"):
+            st.code(str(exc))
 
+
+# ─────────────────────────────────────────────────────────────
+# RECOMENDAÇÃO
+# ─────────────────────────────────────────────────────────────
 
 def calculate_score(row, filtros: dict) -> float:
     pesos = {
@@ -407,11 +443,7 @@ def render_image(image_url: str):
         st.image(image_url, use_container_width=True)
     except Exception:
         st.markdown(
-            f"""
-            <a href="{image_url}" target="_blank">
-                Abrir imagem da recomendação
-            </a>
-            """,
+            f'<a href="{image_url}" target="_blank">Abrir imagem da recomendação</a>',
             unsafe_allow_html=True,
         )
 
@@ -466,6 +498,10 @@ def render_result(row, rank: int):
         st.markdown("</div>", unsafe_allow_html=True)
 
 
+# ─────────────────────────────────────────────────────────────
+# INTERFACE
+# ─────────────────────────────────────────────────────────────
+
 st.markdown(
     """
     <div class="liivv-header">
@@ -491,7 +527,7 @@ if not st.session_state.get("cliente_autorizado"):
     )
 
     try:
-        clientes_df = load_clients(CLIENTS_CSV_URL)
+        clientes_df = load_clients()
     except Exception as exc:
         st.error("Não foi possível carregar a lista de clientes autorizados.")
         with st.expander("Detalhes técnicos"):
@@ -510,7 +546,7 @@ if not st.session_state.get("cliente_autorizado"):
             "nome_informado": nome_login,
             "telefone_informado": telefone_login,
             "status_acesso": "autorizado" if autorizado else "negado",
-            "acao": "login"
+            "acao": "login",
         })
 
         if autorizado:
@@ -541,7 +577,7 @@ st.markdown(
 
 try:
     with st.spinner("Carregando recomendações Glow Glam..."):
-        df = load_data(SHEET_URL)
+        df = load_data()
 except Exception as exc:
     st.error("Não foi possível carregar a base Glow Glam.")
     with st.expander("Detalhes técnicos"):
